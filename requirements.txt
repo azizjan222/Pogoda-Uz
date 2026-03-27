@@ -2,3 +2,5 @@ aiogram
 aiohttp
 apscheduler
 python-dotenv
+pandas
+openpyxl
