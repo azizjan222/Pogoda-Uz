@@ -216,6 +216,53 @@ async def main():
     init_db()
     print("Bot ishga tushdi...")
     await dp.start_polling(bot)
+# --- ADMIN PANEL ---
+@dp.message(F.text == "/admin", F.from_user.id == ADMIN_ID)
+async def admin_menu(message: types.Message):
+    kb = [
+        [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="📢 Reklama tarqatish", callback_data="admin_broadcast")]
+    ]
+    await message.answer("Xush kelibsiz, Admin! Kerakli bo'limni tanlang:", 
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
+@dp.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
+async def show_stats(callback: types.CallbackQuery):
+    conn = sqlite3.connect('weather_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT COUNT(*) FROM users')
+    count = cursor.fetchone()[0]
+    conn.close()
+    await callback.message.answer(f"👥 Botdagi jami foydalanuvchilar: {count} ta")
+    await callback.answer()
+
+# Reklama yuborish uchun oddiyroq usul
+@dp.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
+async def start_broadcast(callback: types.CallbackQuery):
+    await callback.message.answer("Reklama xabarini yuboring (matn ko'rinishida):")
+    await callback.answer()
+
+@dp.message(F.from_user.id == ADMIN_ID, F.text)
+async def do_broadcast(message: types.Message):
+    # Agar xabar /admin bo'lmasa, uni reklama deb hisoblaymiz
+    if message.text == "/admin": return
+
+    conn = sqlite3.connect('weather_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    users = cursor.fetchall()
+    conn.close()
+
+    count = 0
+    for user in users:
+        try:
+            await bot.send_message(user[0], message.text)
+            count += 1
+            await asyncio.sleep(0.05) # Telegram bloklab qo'ymasligi uchun pauza
+        except:
+            continue
+    
+    await message.answer(f"✅ Reklama {count} ta foydalanuvchiga yuborildi!")
+    
 if __name__ == "__main__":
     asyncio.run(main())
