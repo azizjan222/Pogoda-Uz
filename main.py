@@ -31,6 +31,41 @@ class AdminStates(StatesGroup):
 class UserStates(StatesGroup):
     setting_reminder = State()
 
+# --- OB-HAVO TARJIMONI (INGLIZCHADAN O'ZBEKCHAGA) ---
+WEATHER_UZ = {
+    "clear sky": "Musaffo osmon",
+    "few clouds": "Bir oz bulutli",
+    "scattered clouds": "Tarqoq bulutlar",
+    "broken clouds": "Parcha bulutlar",
+    "overcast clouds": "Qalin bulutli",
+    "light rain": "Yengil yomg'ir",
+    "moderate rain": "O'rtacha yomg'ir",
+    "heavy intensity rain": "Kuchli yomg'ir",
+    "very heavy rain": "Juda kuchli yomg'ir",
+    "extreme rain": "Jala",
+    "freezing rain": "Muzli yomg'ir",
+    "light intensity shower rain": "Yengil jala",
+    "shower rain": "Jala",
+    "heavy intensity shower rain": "Kuchli jala",
+    "thunderstorm": "Momaqaldiroq",
+    "snow": "Qor",
+    "light snow": "Yengil qor",
+    "heavy snow": "Qalin qor",
+    "sleet": "Qor aralash yomg'ir",
+    "mist": "Tuman",
+    "fog": "Quyuq tuman",
+    "haze": "G'ubor",
+    "dust": "Chang",
+    "smoke": "Tutun",
+    "sand/ dust whirls": "Qumli bo'ron"
+}
+
+def get_desc(desc_en, lang):
+    if lang == 'uz':
+        # Agar so'z lug'atimizda bo'lsa o'zbekchasini beradi, bo'lmasa borini bosh harf bilan qaytaradi
+        return WEATHER_UZ.get(desc_en.lower(), desc_en.capitalize())
+    return desc_en.capitalize()
+
 # --- HUDUDLAR RO'YXATI ---
 UZB_REGIONS = {
     "Toshkent sh.": ["Tashkent"],
@@ -261,7 +296,6 @@ async def admin_unban_do(message: types.Message, state: FSMContext):
     except: await message.answer("Xato ID.")
     await state.clear()
 
-
 # --- FOYDALANUVCHI HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
@@ -282,9 +316,7 @@ async def set_lang(callback: types.CallbackQuery):
     update_db("UPDATE users SET lang=? WHERE user_id=?", (lang, callback.from_user.id))
     await callback.message.delete()
     
-    # 1. Pastda Lokatsiya tugmasini chiqaramiz
     await callback.message.answer(TEXTS[lang]['send_loc_prompt'], reply_markup=location_reply(lang))
-    # 2. Xabar bilan viloyatlar inline tugmasini chiqaramiz
     await callback.message.answer(TEXTS[lang]['region'], reply_markup=regions_inline())
 
 @dp.callback_query(F.data.startswith("setr_"))
@@ -293,7 +325,6 @@ async def set_region(callback: types.CallbackQuery):
     builder = []
     for dist in UZB_REGIONS[reg]:
         builder.append([InlineKeyboardButton(text=dist, callback_data=f"setd_{dist}")])
-    # Tumanlar ro'yxati chiqadi
     await callback.message.edit_text(TEXTS['uz']['district'], reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
 
 @dp.callback_query(F.data.startswith("setd_"))
@@ -304,7 +335,6 @@ async def set_district(callback: types.CallbackQuery):
     u = get_db_data("SELECT lang FROM users WHERE user_id=?", (user_id,))
     await callback.message.delete()
     
-    # Yashil pichka olib tashlandi. O'rniga Asosiy menyu matni chiqadi.
     await callback.message.answer(TEXTS[u[0]]['menu_btn'], reply_markup=main_reply(u[0]))
 
 # --- LOKATSIYA ORQALI ANIQLASH ---
@@ -327,9 +357,13 @@ async def handle_location(message: types.Message):
             
     if data.get("main"):
         update_db("UPDATE users SET city=? WHERE user_id=?", (data['name'], user_id))
+        
+        # Tarjimon funksiyasidan foydalanamiz
+        translated_desc = get_desc(data['weather'][0]['description'], lang)
+        
         text = TEXTS[lang]['weather_now'].format(
             city=data['name'], temp=round(data['main']['temp']),
-            desc=data['weather'][0]['description'].capitalize(), wind=data['wind']['speed']
+            desc=translated_desc, wind=data['wind']['speed']
         )
         await message.answer(text, reply_markup=main_reply(lang))
     else:
@@ -347,9 +381,11 @@ async def weather_now(message: types.Message):
         
     data = await get_weather_data(u[1], u[0])
     if data.get("main"):
+        translated_desc = get_desc(data['weather'][0]['description'], u[0])
+        
         text = TEXTS[u[0]]['weather_now'].format(
             city=data['name'], temp=round(data['main']['temp']),
-            desc=data['weather'][0]['description'].capitalize(), wind=data['wind']['speed']
+            desc=translated_desc, wind=data['wind']['speed']
         )
         await message.answer(text)
     else:
@@ -368,7 +404,9 @@ async def weather_forecast(message: types.Message):
         for i in range(0, 40, 8):
             day = data['list'][i]
             date = day['dt_txt'].split(" ")[0]
-            res += f"\n🔹 {date}: {round(day['main']['temp'])}°C, {day['weather'][0]['description']}"
+            translated_desc = get_desc(day['weather'][0]['description'], u[0])
+            
+            res += f"\n🔹 {date}: {round(day['main']['temp'])}°C, {translated_desc}"
         await message.answer(res)
     else:
         await message.answer(TEXTS[u[0]]['not_found'])
@@ -393,9 +431,11 @@ async def check_reminders():
     for u in users:
         data = await get_weather_data(u[2], u[1])
         if data.get("main"):
+            translated_desc = get_desc(data['weather'][0]['description'], u[1])
+            
             text = f"🔔 Kunlik eslatma!\n" + TEXTS[u[1]]['weather_now'].format(
                 city=data['name'], temp=round(data['main']['temp']),
-                desc=data['weather'][0]['description'].capitalize(), wind=data['wind']['speed']
+                desc=translated_desc, wind=data['wind']['speed']
             )
             try: await bot.send_message(u[0], text)
             except: pass
@@ -408,4 +448,4 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-    
+        
