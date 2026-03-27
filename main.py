@@ -2,12 +2,17 @@ import asyncio
 import aiohttp
 import sqlite3
 import os
+import pandas as pd
+from datetime import datetime
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F, types
-from aiogram.filters import CommandStart
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters import CommandStart, Command
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+# .env yuklash
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 WEATHER_API_KEY = os.getenv("WEATHER_API")
@@ -17,12 +22,24 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 scheduler = AsyncIOScheduler()
 
-# --- VILOYAT VA TUMANLAR RO'YXATI ---
+# --- HOLATLAR (FSM) ---
+class AdminStates(StatesGroup):
+    waiting_for_broadcast = State()
+    waiting_for_ban = State()
+    waiting_for_unban = State()
+
+class UserStates(StatesGroup):
+    choosing_lang = State()
+    choosing_region = State()
+    choosing_district = State()
+    setting_reminder = State()
+
+# --- HUDUDLAR RO'YXATI ---
 UZB_REGIONS = {
     "Toshkent sh.": ["Tashkent"],
     "Surxondaryo": ["Termez", "Sariosiyo", "Denov", "Sherobod", "Boysun", "Qumqo'rg'on", "Sho'rchi", "Jarqo'rg'on", "Angor", "Muzrabot", "Qiziriq", "Bandixon", "Uzun", "Oltinsoy"],
-    "Toshkent v.": ["Chirchiq", "Angren", "Olmaliq", "Nurafshon", "Zangiota", "Qibray", "Parkent", "Bo'stonliq"],
     "Samarqand": ["Samarkand", "Urgut", "Kattaqo'rg'on", "Jomboy", "Toyloq", "Ishtixon", "Payariq", "Bulung'ur"],
+    "Toshkent v.": ["Chirchiq", "Angren", "Olmaliq", "Nurafshon", "Zangiota", "Qibray", "Parkent", "Bo'stonliq"],
     "Farg'ona": ["Fergana", "Margilan", "Qo'qon", "Quva", "Rishton", "Beshariq", "Oltiariq"],
     "Andijon": ["Andijan", "Asaka", "Shahrixon", "Xo'jaobod", "Baliqchi", "Izboskan"],
     "Namangan": ["Namangan", "Chust", "Kosonsoy", "To'raqo'rg'on", "Uychi", "Pop"],
@@ -39,230 +56,244 @@ UZB_REGIONS = {
 def init_db():
     conn = sqlite3.connect('weather_bot.db')
     cursor = conn.cursor()
-    cursor.execute('''CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY, lang TEXT DEFAULT 'uz', city TEXT DEFAULT 'Tashkent')''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        lang TEXT,
+        city TEXT,
+        is_banned INTEGER DEFAULT 0,
+        reminder_time TEXT DEFAULT 'OFF',
+        last_active TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)''')
+    cursor.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('maintenance', '0')")
     conn.commit()
     conn.close()
 
-def get_user(user_id):
+def get_db_data(query, params=(), fetchone=True):
     conn = sqlite3.connect('weather_bot.db')
     cursor = conn.cursor()
-    cursor.execute('SELECT lang, city FROM users WHERE user_id = ?', (user_id,))
-    user = cursor.fetchone()
-    if user is None:
-        cursor.execute('INSERT INTO users (user_id, lang, city) VALUES (?, ?, ?)', (user_id, 'uz', 'Tashkent'))
-        conn.commit()
-        user = ('uz', 'Tashkent')
+    cursor.execute(query, params)
+    res = cursor.fetchone() if fetchone else cursor.fetchall()
     conn.close()
-    return {'lang': user[0], 'city': user[1]}
+    return res
 
-def update_user_city(user_id, city):
+def update_db(query, params=()):
     conn = sqlite3.connect('weather_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET city = ? WHERE user_id = ?', (city, user_id))
+    conn.execute(query, params)
     conn.commit()
     conn.close()
 
-def update_user_lang(user_id, lang):
-    conn = sqlite3.connect('weather_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('UPDATE users SET lang = ? WHERE user_id = ?', (lang, user_id))
-    conn.commit()
-    conn.close()
-
-# --- KLAVIATURALAR ---
+# --- MATNLAR ---
 TEXTS = {
     'uz': {
-        'start_msg': "Assalomu alaykum! Hududingizni tanlang yoki pastdagi tugma orqali lokatsiya yuboring:",
-        'loc_btn': "📍 Lokatsiyani yuborish",
-        'lang_btn': "🌐 Tilni o'zgartirish",
-        'city_btn': "🏢 Hududni o'zgartirish",
-        'weather': "📍 {city} ob-havosi:\n🌡 Harorat: {temp}°C\n☁️ Holat: {desc}\n💨 Shamol: {wind} m/s",
-        'not_found': "Ma'lumot topilmadi."
+        'start': "Assalomu alaykum! Tilni tanlang / Выберите язык:",
+        'region': "Viloyatni tanlang:",
+        'district': "Tumanni tanlang:",
+        'menu_btn': "Asosiy menyu",
+        'now_btn': "🌡 Hozirgi ob-havo",
+        'forecast_btn': "📅 5 kunlik prognoz",
+        'reminder_btn': "⏰ Eslatma sozlash",
+        'settings_btn': "⚙️ Sozlamalar",
+        'weather_now': "📍 {city}\n🌡 Harorat: {temp}°C\n☁️ Holat: {desc}\n💨 Shamol: {wind} m/s",
+        'ask_time': "Eslatma vaqtini kiriting (masalan 08:00). O'chirish uchun 'OFF' deb yozing:",
+        'banned': "🚫 Siz bloklangansiz.",
+        'maintenance': "🛠 Botda texnik ishlar ketmoqda."
     },
     'ru': {
-        'start_msg': "Здравствуйте! Выберите регион или отправьте локацию:",
-        'loc_btn': "📍 Отправить локацию",
-        'lang_btn': "🌐 Изменить язык",
-        'city_btn': "🏢 Изменить регион",
-        'weather': "📍 Погода в {city}:\n🌡 Температура: {temp}°C\n☁️ Состояние: {desc}\n💨 Ветер: {wind} м/с",
-        'not_found': "Данные не найдены."
+        'start': "Здравствуйте! Выберите язык:",
+        'region': "Выберите область:",
+        'district': "Выберите район:",
+        'menu_btn': "Главное меню",
+        'now_btn': "🌡 Погода сейчас",
+        'forecast_btn': "📅 Прогноз на 5 дней",
+        'reminder_btn': "⏰ Уведомления",
+        'settings_btn': "⚙️ Настройки",
+        'weather_now': "📍 {city}\n🌡 Температура: {temp}°C\n☁️ Состояние: {desc}\n💨 Ветер: {wind} м/с",
+        'ask_time': "Введите время (напр. 08:00). Для выкл. напишите 'OFF':",
+        'banned': "🚫 Вы заблокированы.",
+        'maintenance': "🛠 В боте технические работы."
     }
 }
 
-def main_reply_kb(lang='uz'):
+# --- KLAVIATURALAR ---
+def lang_inline():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="setl_uz"),
+         InlineKeyboardButton(text="🇷🇺 Русский", callback_data="setl_ru")]
+    ])
+
+def regions_inline():
+    builder = []
+    row = []
+    for reg in UZB_REGIONS.keys():
+        row.append(InlineKeyboardButton(text=reg, callback_data=f"setr_{reg}"))
+        if len(row) == 2:
+            builder.append(row); row = []
+    if row: builder.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=builder)
+
+def main_reply(lang):
     kb = [
-        [KeyboardButton(text=TEXTS[lang]['loc_btn'], request_location=True)],
-        [KeyboardButton(text=TEXTS[lang]['city_btn']), KeyboardButton(text=TEXTS[lang]['lang_btn'])]
+        [KeyboardButton(text=TEXTS[lang]['now_btn']), KeyboardButton(text=TEXTS[lang]['forecast_btn'])],
+        [KeyboardButton(text=TEXTS[lang]['reminder_btn']), KeyboardButton(text="📍 Joylashuv/Til")]
     ]
     return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-def regions_kb():
-    builder = []
-    row = []
-    for region in UZB_REGIONS.keys():
-        row.append(InlineKeyboardButton(text=region, callback_data=f"region_{region}"))
-        if len(row) == 2:
-            builder.append(row)
-            row = []
-    if row: builder.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=builder)
+def admin_reply():
+    kb = [
+        [KeyboardButton(text="📊 Statistika"), KeyboardButton(text="📢 Rassilka")],
+        [KeyboardButton(text="💾 DB Yuklash"), KeyboardButton(text="📄 Excel Export")],
+        [KeyboardButton(text="🚫 Ban"), KeyboardButton(text="♻️ Unban")],
+        [KeyboardButton(text="🛠 Maintenance"), KeyboardButton(text="🔙 Foydalanuvchi menyusi")]
+    ]
+    return ReplyKeyboardMarkup(keyboard=kb, resize_keyboard=True)
 
-def districts_kb(region_name):
-    builder = []
-    row = []
-    for district in UZB_REGIONS[region_name]:
-        row.append(InlineKeyboardButton(text=district, callback_data=f"dist_{district}"))
-        if len(row) == 2:
-            builder.append(row)
-            row = []
-    if row: builder.append(row)
-    builder.append([InlineKeyboardButton(text="🔙 Orqaga", callback_data="back_regions")])
-    return InlineKeyboardMarkup(inline_keyboard=builder)
-
-def lang_inline_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🇺🇿 O'zbekcha", callback_data="lang_uz"), InlineKeyboardButton(text="🇷🇺 Русский", callback_data="lang_ru")]
-    ])
-
-# --- OB-HAVO SO'ROVI ---
-async def fetch_weather(url):
+# --- OB-HAVO FUNKSIYALARI ---
+async def get_weather_data(city, lang, mode="weather"):
+    url = f"https://api.openweathermap.org/data/2.5/{mode}?q={city}&appid={WEATHER_API_KEY}&units=metric&lang={lang}"
     async with aiohttp.ClientSession() as session:
-        async with session.get(url) as response:
-            return await response.json()
+        async with session.get(url) as r:
+            return await r.json()
 
-# --- ASOSIY FUNKSIYALAR ---
+# --- ADMIN HANDLERS ---
+@dp.message(Command("admin"), F.from_user.id == ADMIN_ID)
+async def admin_start(message: types.Message):
+    await message.answer("🛠 Admin panelga xush kelibsiz!", reply_markup=admin_reply())
+
+@dp.message(F.text == "📊 Statistika", F.from_user.id == ADMIN_ID)
+async def admin_stats(message: types.Message):
+    total = get_db_data("SELECT COUNT(*) FROM users")[0]
+    banned = get_db_data("SELECT COUNT(*) FROM users WHERE is_banned=1")[0]
+    await message.answer(f"👥 Jami: {total}\n🚫 Bloklanganlar: {banned}")
+
+@dp.message(F.text == "💾 DB Yuklash", F.from_user.id == ADMIN_ID)
+async def admin_db(message: types.Message):
+    await message.answer_document(FSInputFile("weather_bot.db"))
+
+@dp.message(F.text == "📄 Excel Export", F.from_user.id == ADMIN_ID)
+async def admin_excel(message: types.Message):
+    conn = sqlite3.connect('weather_bot.db')
+    df = pd.read_sql_query("SELECT * FROM users", conn)
+    df.to_excel("users.xlsx", index=False)
+    conn.close()
+    await message.answer_document(FSInputFile("users.xlsx"))
+
+@dp.message(F.text == "🛠 Maintenance", F.from_user.id == ADMIN_ID)
+async def admin_maint(message: types.Message):
+    curr = get_db_data("SELECT value FROM settings WHERE key='maintenance'")[0]
+    new = '1' if curr == '0' else '0'
+    update_db("UPDATE settings SET value=? WHERE key='maintenance'", (new,))
+    await message.answer(f"Texnik xizmat: {'YOQILDI' if new=='1' else 'OCHILDI'}")
+
+@dp.message(F.text == "📢 Rassilka", F.from_user.id == ADMIN_ID)
+async def admin_broadcast_start(message: types.Message, state: FSMContext):
+    await message.answer("Reklama xabarini yuboring (Rasm, Video yoki Matn):")
+    await state.set_state(AdminStates.waiting_for_broadcast)
+
+@dp.message(AdminStates.waiting_for_broadcast, F.from_user.id == ADMIN_ID)
+async def admin_broadcast_send(message: types.Message, state: FSMContext):
+    users = get_db_data("SELECT user_id FROM users WHERE is_banned=0", fetchone=False)
+    count = 0
+    for u in users:
+        try:
+            await message.copy_to(u[0])
+            count += 1
+            await asyncio.sleep(0.05)
+        except: continue
+    await state.clear()
+    await message.answer(f"✅ {count} ta odamga yuborildi.")
+
+# --- FOYDALANUVCHI HANDLERS ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    user_data = get_user(message.from_user.id)
-    lang = user_data['lang']
-    # Pastki klaviaturani ham, ichki (inline) klaviaturani ham bittada chiqaramiz
-    await message.answer("Tizimga xush kelibsiz!", reply_markup=main_reply_kb(lang))
-    await message.answer(TEXTS[lang]['start_msg'], reply_markup=regions_kb())
-
-# Til tugmasi
-@dp.message(F.text.in_(["🌐 Tilni o'zgartirish", "🌐 Изменить язык"]))
-async def change_lang_cmd(message: types.Message):
-    await message.answer("Tilni tanlang / Выберите язык:", reply_markup=lang_inline_kb())
-
-# Hudud tugmasi
-@dp.message(F.text.in_(["🏢 Hududni o'zgartirish", "🏢 Изменить регион"]))
-async def change_city_cmd(message: types.Message):
-    user_data = get_user(message.from_user.id)
-    await message.answer(TEXTS[user_data['lang']]['start_msg'], reply_markup=regions_kb())
-
-# Til tanlash reaksiyasi
-@dp.callback_query(F.data.startswith('lang_'))
-async def process_lang(callback: types.CallbackQuery):
-    lang = callback.data.split('_')[1]
-    update_user_lang(callback.from_user.id, lang)
-    await callback.message.delete()
-    await callback.message.answer(TEXTS[lang]['start_msg'], reply_markup=regions_kb())
-    # Klaviaturani yangilash uchun bildirishnoma
-    await callback.message.answer("Til o'zgardi", reply_markup=main_reply_kb(lang))
-
-# Viloyat tanlash reaksiyasi
-@dp.callback_query(F.data.startswith('region_'))
-async def process_region(callback: types.CallbackQuery):
-    region_name = callback.data.split('_')[1]
-    await callback.message.edit_text(f"🏙 {region_name} tumanlari:", reply_markup=districts_kb(region_name))
-
-# Orqaga qaytish reaksiyasi
-@dp.callback_query(F.data == "back_regions")
-async def process_back(callback: types.CallbackQuery):
-    user_data = get_user(callback.from_user.id)
-    await callback.message.edit_text(TEXTS[user_data['lang']]['start_msg'], reply_markup=regions_kb())
-
-# Tuman tanlash reaksiyasi (Ob-havoni chiqarish)
-@dp.callback_query(F.data.startswith('dist_'))
-async def process_district(callback: types.CallbackQuery):
-    district_name = callback.data.split('_')[1]
-    user_id = callback.from_user.id
-    update_user_city(user_id, district_name)
-    user_data = get_user(user_id)
-    lang = user_data['lang']
-    
-    await callback.message.delete()
-    url = f"https://api.openweathermap.org/data/2.5/weather?q={district_name}&appid={WEATHER_API_KEY}&units=metric&lang={lang}"
-    data = await fetch_weather(url)
-    
-    if data.get("main"):
-        text = TEXTS[lang]['weather'].format(
-            city=data['name'], temp=round(data['main']['temp']),
-            desc=data['weather'][0]['description'].capitalize(), wind=data['wind']['speed']
-        )
-        await callback.message.answer(text, reply_markup=main_reply_kb(lang))
-    else:
-        await callback.message.answer(TEXTS[lang]['not_found'])
-
-# Lokatsiya yuborganda ishlaydigan reaksiya
-@dp.message(F.location)
-async def handle_loc(message: types.Message):
     user_id = message.from_user.id
-    lang = get_user(user_id)['lang']
-    lat, lon = message.location.latitude, message.location.longitude
+    # Bazada bormi tekshirish
+    exists = get_db_data("SELECT user_id FROM users WHERE user_id=?", (user_id,))
+    if not exists:
+        update_db("INSERT INTO users (user_id) VALUES (?)", (user_id,))
     
-    url = f"https://api.openweathermap.org/data/2.5/weather?lat={lat}&lon={lon}&appid={WEATHER_API_KEY}&units=metric&lang={lang}"
-    data = await fetch_weather(url)
+    await message.answer(TEXTS['uz']['start'], reply_markup=lang_inline())
+
+@dp.callback_query(F.data.startswith("setl_"))
+async def set_lang(callback: types.CallbackQuery):
+    lang = callback.data.split("_")[1]
+    update_db("UPDATE users SET lang=? WHERE user_id=?", (lang, callback.from_user.id))
+    await callback.message.edit_text(TEXTS[lang]['region'], reply_markup=regions_inline())
+
+@dp.callback_query(F.data.startswith("setr_"))
+async def set_region(callback: types.CallbackQuery):
+    reg = callback.data.split("_")[1]
+    builder = []
+    for dist in UZB_REGIONS[reg]:
+        builder.append([InlineKeyboardButton(text=dist, callback_data=f"setd_{dist}")])
+    await callback.message.edit_text(TEXTS['uz']['district'], reply_markup=InlineKeyboardMarkup(inline_keyboard=builder))
+
+@dp.callback_query(F.data.startswith("setd_"))
+async def set_district(callback: types.CallbackQuery):
+    dist = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    update_db("UPDATE users SET city=? WHERE user_id=?", (dist, user_id))
+    u = get_db_data("SELECT lang FROM users WHERE user_id=?", (user_id,))
+    await callback.message.delete()
+    await callback.message.answer("✅", reply_markup=main_reply(u[0]))
+
+# Ob-havo ko'rsatish
+@dp.message(F.text.in_([TEXTS['uz']['now_btn'], TEXTS['ru']['now_btn']]))
+async def weather_now(message: types.Message):
+    u = get_db_data("SELECT lang, city, is_banned FROM users WHERE user_id=?", (message.from_user.id,))
+    if u[2]: return await message.answer(TEXTS[u[0]]['banned'])
     
+    data = await get_weather_data(u[1], u[0])
     if data.get("main"):
-        update_user_city(user_id, data['name'])
-        text = TEXTS[lang]['weather'].format(
+        text = TEXTS[u[0]]['weather_now'].format(
             city=data['name'], temp=round(data['main']['temp']),
             desc=data['weather'][0]['description'].capitalize(), wind=data['wind']['speed']
         )
-        await message.answer(text, reply_markup=main_reply_kb(lang))
+        await message.answer(text)
+
+@dp.message(F.text.in_([TEXTS['uz']['forecast_btn'], TEXTS['ru']['forecast_btn']]))
+async def weather_forecast(message: types.Message):
+    u = get_db_data("SELECT lang, city FROM users WHERE user_id=?", (message.from_user.id,))
+    data = await get_weather_data(u[1], u[0], mode="forecast")
+    res = f"📅 {u[1]} - 5 kunlik:\n"
+    for i in range(0, 40, 8):
+        day = data['list'][i]
+        date = day['dt_txt'].split(" ")[0]
+        res += f"\n🔹 {date}: {round(day['main']['temp'])}°C, {day['weather'][0]['description']}"
+    await message.answer(res)
+
+# Eslatma sozlash
+@dp.message(F.text.in_([TEXTS['uz']['reminder_btn'], TEXTS['ru']['reminder_btn']]))
+async def reminder_start(message: types.Message, state: FSMContext):
+    u = get_db_data("SELECT lang FROM users WHERE user_id=?", (message.from_user.id,))
+    await message.answer(TEXTS[u[0]]['ask_time'])
+    await state.set_state(UserStates.setting_reminder)
+
+@dp.message(UserStates.setting_reminder)
+async def reminder_save(message: types.Message, state: FSMContext):
+    update_db("UPDATE users SET reminder_time=? WHERE user_id=?", (message.text, message.from_user.id))
+    await state.clear()
+    await message.answer("💾")
+
+# --- SCHEDULER ---
+async def check_reminders():
+    now = datetime.now().strftime("%H:%M")
+    users = get_db_data("SELECT user_id, lang, city FROM users WHERE reminder_time=?", (now,), fetchone=False)
+    for u in users:
+        data = await get_weather_data(u[2], u[1])
+        text = f"🔔 Eslatma!\n" + TEXTS[u[1]]['weather_now'].format(
+            city=data['name'], temp=round(data['main']['temp']),
+            desc=data['weather'][0]['description'], wind=data['wind']['speed']
+        )
+        try: await bot.send_message(u[0], text)
+        except: pass
 
 async def main():
     init_db()
-    print("Bot ishga tushdi...")
+    scheduler.add_job(check_reminders, "interval", minutes=1)
+    scheduler.start()
     await dp.start_polling(bot)
-# --- ADMIN PANEL ---
-@dp.message(F.text == "/admin", F.from_user.id == ADMIN_ID)
-async def admin_menu(message: types.Message):
-    kb = [
-        [InlineKeyboardButton(text="📊 Statistika", callback_data="admin_stats")],
-        [InlineKeyboardButton(text="📢 Reklama tarqatish", callback_data="admin_broadcast")]
-    ]
-    await message.answer("Xush kelibsiz, Admin! Kerakli bo'limni tanlang:", 
-                         reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
 
-@dp.callback_query(F.data == "admin_stats", F.from_user.id == ADMIN_ID)
-async def show_stats(callback: types.CallbackQuery):
-    conn = sqlite3.connect('weather_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT COUNT(*) FROM users')
-    count = cursor.fetchone()[0]
-    conn.close()
-    await callback.message.answer(f"👥 Botdagi jami foydalanuvchilar: {count} ta")
-    await callback.answer()
-
-# Reklama yuborish uchun oddiyroq usul
-@dp.callback_query(F.data == "admin_broadcast", F.from_user.id == ADMIN_ID)
-async def start_broadcast(callback: types.CallbackQuery):
-    await callback.message.answer("Reklama xabarini yuboring (matn ko'rinishida):")
-    await callback.answer()
-
-@dp.message(F.from_user.id == ADMIN_ID, F.text)
-async def do_broadcast(message: types.Message):
-    # Agar xabar /admin bo'lmasa, uni reklama deb hisoblaymiz
-    if message.text == "/admin": return
-
-    conn = sqlite3.connect('weather_bot.db')
-    cursor = conn.cursor()
-    cursor.execute('SELECT user_id FROM users')
-    users = cursor.fetchall()
-    conn.close()
-
-    count = 0
-    for user in users:
-        try:
-            await bot.send_message(user[0], message.text)
-            count += 1
-            await asyncio.sleep(0.05) # Telegram bloklab qo'ymasligi uchun pauza
-        except:
-            continue
-    
-    await message.answer(f"✅ Reklama {count} ta foydalanuvchiga yuborildi!")
-    
 if __name__ == "__main__":
     asyncio.run(main())
+            
